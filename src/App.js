@@ -1,12 +1,13 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-const FPS = 30;
-
 const PickleballAnalyzer = () => {
   const [url, setUrl] = useState(
     process.env.PUBLIC_URL + '/pbvideo/sample.mp4'
   );
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [fps, setFps] = useState(30);            // ← default until JSON loads
+  const [motionData, setMotionData] = useState([]); // ← array of motion values
+
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
 
@@ -19,7 +20,7 @@ const PickleballAnalyzer = () => {
     }
   };
 
-  // Sync playbackRate
+  // Sync playbackRate to the video element
   useEffect(() => {
     const video = videoRef.current;
     if (video) {
@@ -27,55 +28,84 @@ const PickleballAnalyzer = () => {
     }
   }, [playbackRate]);
 
-  // Canvas overlay: rectangle + time and frame number
+  // Whenever URL changes, fetch the JSON alongside it
+  useEffect(() => {
+    const jsonUrl = url.replace(/\.mp4$/, '.json');
+    fetch(jsonUrl)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        // pull fps and motion out
+        setFps(typeof data.fps === 'number' ? data.fps : 30);
+        setMotionData(Array.isArray(data.motion) ? data.motion : []);
+      })
+      .catch(err => {
+        console.error('Failed to load motion JSON:', err);
+        // fallback
+        setFps(30);
+        setMotionData([]);
+      });
+  }, [url]);
+
+  // Canvas overlay: inset rectangle + time + frame + motion
   useEffect(() => {
     const drawOverlay = () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       if (!video || !canvas) return;
+
+      // match canvas to video display size
       canvas.width = video.clientWidth;
       canvas.height = video.clientHeight;
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Inset rectangle
+      // red inset rectangle
       ctx.beginPath();
       ctx.rect(8, 8, canvas.width - 16, canvas.height - 16);
       ctx.strokeStyle = 'red';
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // Time and frame number
+      // compute time, frame, motion
       const currentTime = video.currentTime;
-      const timeText = currentTime.toFixed(3) + 's';
-      const frameNumber = Math.floor(currentTime * FPS);
+      const frameNumber = Math.floor(currentTime * fps);
+      const motionVal =
+        motionData.length > frameNumber ? motionData[frameNumber] : 0;
+
+      // draw text
       ctx.font = '16px sans-serif';
       ctx.fillStyle = 'yellow';
       ctx.textBaseline = 'bottom';
-      // Display time above frame number
-      ctx.fillText(`Time: ${timeText}`, 10, canvas.height - 10 - 20);
-      ctx.fillText(`Frame: ${frameNumber}`, 10, canvas.height - 10);
+      ctx.fillText(`Time: ${currentTime.toFixed(3)}s`, 10, canvas.height - 10 - 40);
+      ctx.fillText(`Frame: ${frameNumber}`,     10, canvas.height - 10 - 20);
+      ctx.fillText(`Motion: ${motionVal.toFixed(2)}`, 10, canvas.height - 10);
     };
 
+    // attach listeners
     window.addEventListener('resize', drawOverlay);
     const video = videoRef.current;
     if (video) {
       video.addEventListener('loadeddata', drawOverlay);
-      video.addEventListener('timeupdate', drawOverlay);
-      video.addEventListener('seeked', drawOverlay);
+      video.addEventListener('timeupdate',  drawOverlay);
+      video.addEventListener('seeked',      drawOverlay);
     }
     drawOverlay();
+
+    // cleanup
     return () => {
       window.removeEventListener('resize', drawOverlay);
       if (video) {
         video.removeEventListener('loadeddata', drawOverlay);
-        video.removeEventListener('timeupdate', drawOverlay);
-        video.removeEventListener('seeked', drawOverlay);
+        video.removeEventListener('timeupdate',  drawOverlay);
+        video.removeEventListener('seeked',      drawOverlay);
       }
     };
-  }, [url, playbackRate]);
+  }, [url, playbackRate, fps, motionData]);
 
-  // Keyboard controls
+  // Keyboard controls, now using dynamic fps for step size
   useEffect(() => {
     const handleKeyDown = (e) => {
       const video = videoRef.current;
@@ -87,21 +117,21 @@ const PickleballAnalyzer = () => {
           break;
         case 'ArrowRight':
           video.pause();
-          video.currentTime += 1 / FPS;
+          video.currentTime += 1 / fps;
           break;
         case 'ArrowLeft':
           video.pause();
-          video.currentTime -= 1 / FPS;
+          video.currentTime -= 1 / fps;
           break;
         case 'ArrowUp':
-          setPlaybackRate((rate) => {
+          setPlaybackRate(rate => {
             const speeds = [0.1, 1, 10];
             const idx = speeds.indexOf(rate);
             return speeds[Math.min(idx + 1, speeds.length - 1)];
           });
           break;
         case 'ArrowDown':
-          setPlaybackRate((rate) => {
+          setPlaybackRate(rate => {
             const speeds = [0.1, 1, 10];
             const idx = speeds.indexOf(rate);
             return speeds[Math.max(idx - 1, 0)];
@@ -113,11 +143,11 @@ const PickleballAnalyzer = () => {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [fps]);  // ← rebind if fps changes
 
   return (
     <div style={{ width: '100%', padding: '16px', boxSizing: 'border-box' }}>
-      {/* Video with canvas overlay */}
+      {/* Video + Canvas */}
       <div style={{ position: 'relative', width: '100%' }}>
         <video
           key={url}
@@ -140,7 +170,7 @@ const PickleballAnalyzer = () => {
         />
       </div>
 
-      {/* URL input and load button */}
+      {/* URL input + Load */}
       <div
         style={{
           display: 'flex',
@@ -152,7 +182,7 @@ const PickleballAnalyzer = () => {
         <input
           type="text"
           value={url}
-          onChange={(e) => setUrl(e.target.value)}
+          onChange={e => setUrl(e.target.value)}
           placeholder="Enter local video path"
           style={{
             flexGrow: 1,
