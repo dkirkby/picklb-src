@@ -30,23 +30,33 @@ const PickleballAnalyzer = () => {
 
   // Whenever URL changes, fetch the JSON alongside it
   useEffect(() => {
-    const jsonUrl = url.replace(/\.mp4$/, '.json');
-    fetch(jsonUrl)
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
-      .then(data => {
-        // pull fps and motion out
+    const fetchMotion = async () => {
+      const jsonUrl = url.replace(/\.mp4$/, '.json');
+      try {
+        const res = await fetch(jsonUrl);
+
+        // 1) Check content-type header
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          alert(`Motion data file not found (got ${contentType}):\n${jsonUrl}`);
+          setFps(30);
+          setMotionData([]);
+          return;
+        }
+
+        // 2) Safe to parse JSON
+        const data = await res.json();
         setFps(typeof data.fps === 'number' ? data.fps : 30);
         setMotionData(Array.isArray(data.motion) ? data.motion : []);
-      })
-      .catch(err => {
-        console.error('Failed to load motion JSON:', err);
-        // fallback
+      } catch (err) {
+        console.error('Fetch error:', err);
+        alert(`Failed to load motion JSON:\n${err.message}`);
         setFps(30);
         setMotionData([]);
-      });
+      }
+    };
+
+    fetchMotion();
   }, [url]);
 
   // Canvas overlay: inset rectangle + time + frame + motion
