@@ -72,13 +72,25 @@ const PickleballAnalyzer = () => {
     };
 
     fetch(url)
-      .then(res => res.arrayBuffer())
-      .then(buffer => {
-        if (cancelled) return;
-        buffer.fileStart = 0;
-        mp4boxFile.appendBuffer(buffer);
+      .then(res => {
+        const reader = res.body.getReader();
+        let offset = 0;
+        function pump() {
+          return reader.read().then(({ done, value }) => {
+            if (done) {
+              mp4boxFile.flush();
+              return;
+            }
+            const buf = value.buffer;
+            buf.fileStart = offset;
+            offset += buf.byteLength;
+            mp4boxFile.appendBuffer(buf);
+            return pump();
+          });
+        }
+        return pump();
       })
-      .catch(err => console.error('Video fetch error:', err));
+      .catch(err => console.error('Video fetch error (stream):', err));
 
     return () => {
       cancelled = true;
