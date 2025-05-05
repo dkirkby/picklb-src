@@ -1,235 +1,176 @@
+/* global VideoDecoder, EncodedVideoChunk */
 import React, { useState, useRef, useEffect } from 'react';
+import MP4Box from 'mp4box';
 
 const PickleballAnalyzer = () => {
   const [url, setUrl] = useState(
     process.env.PUBLIC_URL + '/pbvideo/sample.mp4'
   );
-  const [playbackRate, setPlaybackRate] = useState(1);
-  const [fps, setFps] = useState(30);               // default until JSON loads
-  const [motionData, setMotionData] = useState([]); // array of motion values
-  const [frameTimes, setFrameTimes] = useState([]); // array of exact frame timestamps
 
-  const videoRef = useRef(null);
+  // JSON data: fps, motion values
+  const [fps, setFps] = useState(30);
+  const [motionData, setMotionData] = useState([]);
+
+  // decoded frames and current index
+  const [frames, setFrames] = useState([]);
+  const [currentFrame, setCurrentFrame] = useState(0);
+
   const canvasRef = useRef(null);
+  const decoderRef = useRef(null);
 
-  // Given a playback time, binary-search to find the current frame index
-  const getFrameIndex = (time) => {
-    //return Math.round(time * 92455000/3081833);
-    let lo = 0, hi = frameTimes.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (frameTimes[mid] <= time + 0.001) lo = mid + 1;
-      else hi = mid;
-    }
-    return Math.max(0, lo - 1);
-  };
-
-  // Load video and apply playback rate
-  const loadVideo = () => {
-    const video = videoRef.current;
-    if (video) {
-      video.load();
-      video.playbackRate = playbackRate;
-    }
-  };
-
-  // Whenever URL changes, fetch the accompanying JSON (fps, motion, frame_times)
+  // Load JSON metadata (fps, motion)
   useEffect(() => {
-    const fetchMotion = async () => {
-      const jsonUrl = url.replace(/\.mp4$/, '.json');
-      try {
-        const res = await fetch(jsonUrl);
-        const contentType = res.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          alert(`Motion data not found (got ${contentType}):\n${jsonUrl}`);
-          setFps(30);
-          setMotionData([]);
-          setFrameTimes([]);
-          return;
+    const jsonUrl = url.replace(/\.mp4$/, '.json');
+    fetch(jsonUrl)
+      .then(res => {
+        if (!res.headers.get('content-type')?.includes('application/json')) {
+          throw new Error('Not JSON');
         }
-        const data = await res.json();
+        return res.json();
+      })
+      .then(data => {
         setFps(typeof data.fps === 'number' ? data.fps : 30);
         setMotionData(Array.isArray(data.motion) ? data.motion : []);
-        setFrameTimes(Array.isArray(data.frame_times) ? data.frame_times : []);
-        console.log(data.frame_times);
-      } catch (err) {
-        console.error('Fetch error:', err);
-        alert(`Failed to load motion JSON:\n${err.message}`);
+      })
+      .catch(err => {
+        console.error('JSON load error:', err);
         setFps(30);
         setMotionData([]);
-        setFrameTimes([]);
+      });
+  }, [url]);
+
+  // Initialize WebCodecs + MP4Box demux
+  useEffect(() => {
+    let cancelled = false;
+    let mp4boxFile = MP4Box.createFile();
+
+    const decoder = new VideoDecoder({
+      output: frame => {
+        setFrames(prev => [...prev, frame]);
+      },
+      error: err => console.error('Decoder error:', err)
+    });
+    decoderRef.current = decoder;
+
+    mp4boxFile.onReady = info => {
+      const track = info.tracks.find(t => t.video);
+      if (!track) return;
+      decoder.configure({ codec: track.codec });
+      mp4boxFile.setExtractionOptions(track.id, null, { nbSamples: Infinity });
+      mp4boxFile.start();
+    };
+
+    mp4boxFile.onSamples = (id, user, samples) => {
+      for (const sample of samples) {
+        const chunk = new EncodedVideoChunk({
+          type: sample.is_sync ? 'key' : 'delta',
+          timestamp: sample.cts,
+          data: new Uint8Array(sample.data)
+        });
+        decoder.decode(chunk);
       }
     };
 
-    fetchMotion();
+    fetch(url)
+      .then(res => res.arrayBuffer())
+      .then(buffer => {
+        if (cancelled) return;
+        buffer.fileStart = 0;
+        mp4boxFile.appendBuffer(buffer);
+      })
+      .catch(err => console.error('Video fetch error:', err));
+
+    return () => {
+      cancelled = true;
+      decoder.close();
+      mp4boxFile.flush();
+      mp4boxFile = null;
+      // close leftover frames
+      frames.forEach(f => f.close());
+    };
   }, [url]);
 
-  // Canvas overlay: inset rectangle + time + frame + motion
+  // Draw when frames load or currentFrame changes
   useEffect(() => {
-    const drawOverlay = () => {
-      const video = videoRef.current;
+    async function draw() {
       const canvas = canvasRef.current;
-      if (!video || !canvas) return;
-
-      // match canvas to video size
-      canvas.width = video.clientWidth;
-      canvas.height = video.clientHeight;
+      if (!canvas) return;
       const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!ctx || !frames[currentFrame]) return;
 
-      // red inset rectangle
-      ctx.beginPath();
-      ctx.rect(8, 8, canvas.width - 16, canvas.height - 16);
+      const frame = frames[currentFrame];
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(frame);
+      } catch (err) {
+        console.error('Bitmap error:', err);
+        return;
+      }
+      // draw
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+
+      // overlay
       ctx.strokeStyle = 'red';
       ctx.lineWidth = 2;
-      ctx.stroke();
+      ctx.strokeRect(8, 8, canvas.width - 16, canvas.height - 16);
 
-      // compute values
-      const currentTime = video.currentTime;
-      const frameIndex = getFrameIndex(currentTime);
-      const motionVal =
-        motionData.length > frameIndex ? motionData[frameIndex] : 0;
-
-      // draw text
+      const time = (currentFrame / fps).toFixed(3);
+      const motionVal = (motionData[currentFrame] ?? 0).toFixed(2);
       ctx.font = '16px sans-serif';
       ctx.fillStyle = 'yellow';
       ctx.textBaseline = 'bottom';
-      ctx.fillText(`Time: ${currentTime.toFixed(3)}s`, 10, canvas.height - 10 - 40);
-      ctx.fillText(`Frame: ${frameIndex}`,         10, canvas.height - 10 - 20);
-      ctx.fillText(`Motion: ${motionVal.toFixed(2)}`, 10, canvas.height - 10);
-    };
-
-    // attach listeners
-    window.addEventListener('resize', drawOverlay);
-    const video = videoRef.current;
-    if (video) {
-      video.addEventListener('loadeddata', drawOverlay);
-      video.addEventListener('timeupdate',  drawOverlay);
-      video.addEventListener('seeked',      drawOverlay);
+      ctx.fillText(`Time: ${time}s`, 10, canvas.height - 40);
+      ctx.fillText(`Frame: ${currentFrame}`, 10, canvas.height - 20);
+      ctx.fillText(`Motion: ${motionVal}`, 10, canvas.height);
     }
-    drawOverlay();
+    draw();
+  }, [frames.length, currentFrame, fps, motionData]);
 
-    // cleanup
-    return () => {
-      window.removeEventListener('resize', drawOverlay);
-      if (video) {
-        video.removeEventListener('loadeddata', drawOverlay);
-        video.removeEventListener('timeupdate',  drawOverlay);
-        video.removeEventListener('seeked',      drawOverlay);
-      }
-    };
-  }, [url, playbackRate, fps, motionData, frameTimes]);
-
-  // Keyboard controls, now stepping via exact frameTimes
+  // Keyboard navigation
   useEffect(() => {
-    const handleKeyDown = (e) => {
-      const video = videoRef.current;
-      if (!video) return;
-      switch (e.key) {
-        case ' ':
-          e.preventDefault();
-          video.paused ? video.play() : video.pause();
-          break;
-        case 'ArrowRight': {
-          video.pause();
-          const idx = getFrameIndex(video.currentTime);
-          console.log('=>', video.currentTime, idx, frameTimes[idx], frameTimes[idx+1]);
-          const next = idx + 1;
-          if (frameTimes[next] != null) {
-            video.currentTime = frameTimes[next];
-          }
-          break;
-        }
-        case 'ArrowLeft': {
-          video.pause();
-          const idx = getFrameIndex(video.currentTime);
-          const prev = Math.max(0, idx - 1);
-          if (frameTimes[prev] != null) {
-            video.currentTime = frameTimes[prev];
-          }
-          break;
-        }
-        case 'ArrowUp':
-          setPlaybackRate((rate) => {
-            const speeds = [0.1, 1, 10];
-            const idx = speeds.indexOf(rate);
-            return speeds[Math.min(idx + 1, speeds.length - 1)];
-          });
-          break;
-        case 'ArrowDown':
-          setPlaybackRate((rate) => {
-            const speeds = [0.1, 1, 10];
-            const idx = speeds.indexOf(rate);
-            return speeds[Math.max(idx - 1, 0)];
-          });
-          break;
-        default:
-          break;
+    const onKey = e => {
+      if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        setCurrentFrame(i => Math.min(frames.length - 1, i + 1));
+      }
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        setCurrentFrame(i => Math.max(0, i - 1));
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fps, frameTimes]);
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [frames.length]);
+
+  // Canvas resize
+  useEffect(() => {
+    const onResize = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = canvas.clientWidth;
+      canvas.height = canvas.clientHeight;
+    };
+    window.addEventListener('resize', onResize);
+    onResize();
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   return (
-    <div style={{ width: '100%', padding: '16px', boxSizing: 'border-box' }}>
-      {/* Video + Canvas */}
-      <div style={{ position: 'relative', width: '100%' }}>
-        <video
-          key={url}
-          ref={videoRef}
-          src={url}
-          style={{ width: '100%', height: 'auto', display: 'block' }}
-        >
-          Your browser does not support the video tag.
-        </video>
+    <div style={{ width: '100%', padding: 16, boxSizing: 'border-box' }}>
+      <div style={{ position: 'relative', width: '100%', aspectRatio: '16/9' }}>
         <canvas
           ref={canvasRef}
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            width: '100%',
-            height: '100%',
-            pointerEvents: 'none',
-          }}
+          style={{ width: '100%', height: '100%', display: 'block' }}
         />
       </div>
-
-      {/* URL input + Load */}
-      <div
-        style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: '16px',
-          marginTop: '16px',
-        }}
-      >
+      <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
         <input
-          type="text"
+          style={{ flex: 1, padding: 8, borderRadius: 4, border: '1px solid #ccc' }}
           value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          placeholder="Enter local video path"
-          style={{
-            flexGrow: 1,
-            padding: '8px',
-            border: '1px solid #ccc',
-            borderRadius: '4px',
-          }}
+          onChange={e => setUrl(e.target.value)}
         />
-        <button
-          onClick={loadVideo}
-          style={{
-            background: '#2563eb',
-            color: '#fff',
-            padding: '8px 16px',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer',
-          }}
-        >
-          Load Video
-        </button>
       </div>
     </div>
   );
