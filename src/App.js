@@ -5,11 +5,24 @@ const PickleballAnalyzer = () => {
     process.env.PUBLIC_URL + '/pbvideo/sample.mp4'
   );
   const [playbackRate, setPlaybackRate] = useState(1);
-  const [fps, setFps] = useState(30);            // ← default until JSON loads
-  const [motionData, setMotionData] = useState([]); // ← array of motion values
+  const [fps, setFps] = useState(30);               // default until JSON loads
+  const [motionData, setMotionData] = useState([]); // array of motion values
+  const [frameTimes, setFrameTimes] = useState([]); // array of exact frame timestamps
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+
+  // Given a playback time, binary-search to find the current frame index
+  const getFrameIndex = (time) => {
+    //return Math.round(time * 92455000/3081833);
+    let lo = 0, hi = frameTimes.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (frameTimes[mid] <= time + 0.001) lo = mid + 1;
+      else hi = mid;
+    }
+    return Math.max(0, lo - 1);
+  };
 
   // Load video and apply playback rate
   const loadVideo = () => {
@@ -20,39 +33,31 @@ const PickleballAnalyzer = () => {
     }
   };
 
-  // Sync playbackRate to the video element
-  useEffect(() => {
-    const video = videoRef.current;
-    if (video) {
-      video.playbackRate = playbackRate;
-    }
-  }, [playbackRate]);
-
-  // Whenever URL changes, fetch the JSON alongside it
+  // Whenever URL changes, fetch the accompanying JSON (fps, motion, frame_times)
   useEffect(() => {
     const fetchMotion = async () => {
       const jsonUrl = url.replace(/\.mp4$/, '.json');
       try {
         const res = await fetch(jsonUrl);
-
-        // 1) Check content-type header
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) {
-          alert(`Motion data file not found (got ${contentType}):\n${jsonUrl}`);
+          alert(`Motion data not found (got ${contentType}):\n${jsonUrl}`);
           setFps(30);
           setMotionData([]);
+          setFrameTimes([]);
           return;
         }
-
-        // 2) Safe to parse JSON
         const data = await res.json();
         setFps(typeof data.fps === 'number' ? data.fps : 30);
         setMotionData(Array.isArray(data.motion) ? data.motion : []);
+        setFrameTimes(Array.isArray(data.frame_times) ? data.frame_times : []);
+        console.log(data.frame_times);
       } catch (err) {
         console.error('Fetch error:', err);
         alert(`Failed to load motion JSON:\n${err.message}`);
         setFps(30);
         setMotionData([]);
+        setFrameTimes([]);
       }
     };
 
@@ -66,7 +71,7 @@ const PickleballAnalyzer = () => {
       const canvas = canvasRef.current;
       if (!video || !canvas) return;
 
-      // match canvas to video display size
+      // match canvas to video size
       canvas.width = video.clientWidth;
       canvas.height = video.clientHeight;
       const ctx = canvas.getContext('2d');
@@ -79,18 +84,18 @@ const PickleballAnalyzer = () => {
       ctx.lineWidth = 2;
       ctx.stroke();
 
-      // compute time, frame, motion
+      // compute values
       const currentTime = video.currentTime;
-      const frameNumber = Math.floor(currentTime * fps);
+      const frameIndex = getFrameIndex(currentTime);
       const motionVal =
-        motionData.length > frameNumber ? motionData[frameNumber] : 0;
+        motionData.length > frameIndex ? motionData[frameIndex] : 0;
 
       // draw text
       ctx.font = '16px sans-serif';
       ctx.fillStyle = 'yellow';
       ctx.textBaseline = 'bottom';
       ctx.fillText(`Time: ${currentTime.toFixed(3)}s`, 10, canvas.height - 10 - 40);
-      ctx.fillText(`Frame: ${frameNumber}`,     10, canvas.height - 10 - 20);
+      ctx.fillText(`Frame: ${frameIndex}`,         10, canvas.height - 10 - 20);
       ctx.fillText(`Motion: ${motionVal.toFixed(2)}`, 10, canvas.height - 10);
     };
 
@@ -113,9 +118,9 @@ const PickleballAnalyzer = () => {
         video.removeEventListener('seeked',      drawOverlay);
       }
     };
-  }, [url, playbackRate, fps, motionData]);
+  }, [url, playbackRate, fps, motionData, frameTimes]);
 
-  // Keyboard controls, now using dynamic fps for step size
+  // Keyboard controls, now stepping via exact frameTimes
   useEffect(() => {
     const handleKeyDown = (e) => {
       const video = videoRef.current;
@@ -125,23 +130,34 @@ const PickleballAnalyzer = () => {
           e.preventDefault();
           video.paused ? video.play() : video.pause();
           break;
-        case 'ArrowRight':
+        case 'ArrowRight': {
           video.pause();
-          video.currentTime += 1 / fps;
+          const idx = getFrameIndex(video.currentTime);
+          console.log('=>', video.currentTime, idx, frameTimes[idx], frameTimes[idx+1]);
+          const next = idx + 1;
+          if (frameTimes[next] != null) {
+            video.currentTime = frameTimes[next];
+          }
           break;
-        case 'ArrowLeft':
+        }
+        case 'ArrowLeft': {
           video.pause();
-          video.currentTime -= 1 / fps;
+          const idx = getFrameIndex(video.currentTime);
+          const prev = Math.max(0, idx - 1);
+          if (frameTimes[prev] != null) {
+            video.currentTime = frameTimes[prev];
+          }
           break;
+        }
         case 'ArrowUp':
-          setPlaybackRate(rate => {
+          setPlaybackRate((rate) => {
             const speeds = [0.1, 1, 10];
             const idx = speeds.indexOf(rate);
             return speeds[Math.min(idx + 1, speeds.length - 1)];
           });
           break;
         case 'ArrowDown':
-          setPlaybackRate(rate => {
+          setPlaybackRate((rate) => {
             const speeds = [0.1, 1, 10];
             const idx = speeds.indexOf(rate);
             return speeds[Math.max(idx - 1, 0)];
@@ -153,7 +169,7 @@ const PickleballAnalyzer = () => {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [fps]);  // ← rebind if fps changes
+  }, [fps, frameTimes]);
 
   return (
     <div style={{ width: '100%', padding: '16px', boxSizing: 'border-box' }}>
@@ -192,7 +208,7 @@ const PickleballAnalyzer = () => {
         <input
           type="text"
           value={url}
-          onChange={e => setUrl(e.target.value)}
+          onChange={(e) => setUrl(e.target.value)}
           placeholder="Enter local video path"
           style={{
             flexGrow: 1,
