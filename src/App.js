@@ -7,18 +7,24 @@ const PickleballAnalyzer = () => {
     process.env.PUBLIC_URL + '/pbvideo/sample.mp4'
   );
 
-  // JSON data: fps, motion values
+  // Metadata from JSON: name, fps, motion, nframes
+  const [fileName, setFileName] = useState('');
   const [fps, setFps] = useState(30);
   const [motionData, setMotionData] = useState([]);
+  const [numFrames, setNumFrames] = useState(0);
 
-  // decoded frames and current index
+  // Thumbnail states
+  const [thumbImage, setThumbImage] = useState(null);
+  const [thumbError, setThumbError] = useState(false);
+
+  // Decoded frames and current index
   const [frames, setFrames] = useState([]);
   const [currentFrame, setCurrentFrame] = useState(0);
 
   const canvasRef = useRef(null);
   const decoderRef = useRef(null);
 
-  // Load JSON metadata (fps, motion)
+  // Load JSON metadata
   useEffect(() => {
     const jsonUrl = url.replace(/\.mp4$/, '.json');
     fetch(jsonUrl)
@@ -29,25 +35,34 @@ const PickleballAnalyzer = () => {
         return res.json();
       })
       .then(data => {
+        setFileName(data.name || url.split('/').pop());
         setFps(typeof data.fps === 'number' ? data.fps : 30);
         setMotionData(Array.isArray(data.motion) ? data.motion : []);
+        setNumFrames(typeof data.nframes === 'number' ? data.nframes : 0);
       })
       .catch(err => {
         console.error('JSON load error:', err);
+        setFileName(url.split('/').pop());
         setFps(30);
         setMotionData([]);
+        setNumFrames(0);
       });
+  }, [url]);
+
+  // Load thumbnail
+  useEffect(() => {
+    const img = new Image();
+    img.onload = () => setThumbImage(img);
+    img.onerror = () => setThumbError(true);
+    img.src = url.replace(/\.mp4$/, '.jpg');
   }, [url]);
 
   // Initialize WebCodecs + MP4Box demux
   useEffect(() => {
-    let cancelled = false;
     let mp4boxFile = MP4Box.createFile();
 
     const decoder = new VideoDecoder({
-      output: frame => {
-        setFrames(prev => [...prev, frame]);
-      },
+      output: frame => setFrames(prev => [...prev, frame]),
       error: err => console.error('Decoder error:', err)
     });
     decoderRef.current = decoder;
@@ -61,48 +76,44 @@ const PickleballAnalyzer = () => {
     };
 
     mp4boxFile.onSamples = (id, user, samples) => {
-      for (const sample of samples) {
+      samples.forEach(sample => {
         const chunk = new EncodedVideoChunk({
           type: sample.is_sync ? 'key' : 'delta',
           timestamp: sample.cts,
           data: new Uint8Array(sample.data)
         });
         decoder.decode(chunk);
-      }
+      });
     };
 
     fetch(url)
       .then(res => {
         const reader = res.body.getReader();
         let offset = 0;
-        function pump() {
-          return reader.read().then(({ done, value }) => {
-            if (done) {
-              mp4boxFile.flush();
-              return;
-            }
-            const buf = value.buffer;
-            buf.fileStart = offset;
-            offset += buf.byteLength;
-            mp4boxFile.appendBuffer(buf);
-            return pump();
-          });
-        }
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) {
+            mp4boxFile.flush();
+            return;
+          }
+          const buf = value.buffer;
+          buf.fileStart = offset;
+          offset += buf.byteLength;
+          mp4boxFile.appendBuffer(buf);
+          return pump();
+        });
         return pump();
       })
-      .catch(err => console.error('Video fetch error (stream):', err));
+      .catch(err => console.error('Video fetch error:', err));
 
     return () => {
-      cancelled = true;
       decoder.close();
       mp4boxFile.flush();
       mp4boxFile = null;
-      // close leftover frames
       frames.forEach(f => f.close());
     };
   }, [url]);
 
-  // Draw when frames load or currentFrame changes
+  // Draw on canvas when frame changes
   useEffect(() => {
     async function draw() {
       const canvas = canvasRef.current;
@@ -110,35 +121,17 @@ const PickleballAnalyzer = () => {
       const ctx = canvas.getContext('2d');
       if (!ctx || !frames[currentFrame]) return;
 
-      const frame = frames[currentFrame];
-      let bitmap;
-      try {
-        bitmap = await createImageBitmap(frame);
-      } catch (err) {
-        console.error('Bitmap error:', err);
-        return;
-      }
-      // draw
+      const bitmap = await createImageBitmap(frames[currentFrame]);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
       bitmap.close();
 
-      // overlay
       ctx.strokeStyle = 'red';
       ctx.lineWidth = 2;
       ctx.strokeRect(8, 8, canvas.width - 16, canvas.height - 16);
-
-      const time = (currentFrame / fps).toFixed(3);
-      const motionVal = (motionData[currentFrame] ?? 0).toFixed(2);
-      ctx.font = '16px sans-serif';
-      ctx.fillStyle = 'yellow';
-      ctx.textBaseline = 'bottom';
-      ctx.fillText(`Time: ${time}s`, 10, canvas.height - 40);
-      ctx.fillText(`Frame: ${currentFrame}`, 10, canvas.height - 20);
-      ctx.fillText(`Motion: ${motionVal}`, 10, canvas.height);
     }
     draw();
-  }, [frames.length, currentFrame, fps, motionData]);
+  }, [currentFrame, frames]);
 
   // Keyboard navigation
   useEffect(() => {
@@ -156,7 +149,7 @@ const PickleballAnalyzer = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [frames.length]);
 
-  // Canvas resize
+  // Canvas resize and CSS layout
   useEffect(() => {
     const onResize = () => {
       const canvas = canvasRef.current;
@@ -171,17 +164,70 @@ const PickleballAnalyzer = () => {
 
   return (
     <div style={{ width: '100%', padding: 16, boxSizing: 'border-box' }}>
-      <div style={{ position: 'relative', width: '100%', aspectRatio: '16/9' }}>
+      <div
+        style={{
+          position: 'relative',
+          width: '100%',
+          aspectRatio: '16/9',
+          background: frames.length === 0 && thumbError ? 'black' : 'none'
+        }}
+      >
+        {/* Initial overlay */}
+        {frames.length === 0 && (
+          <>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            <div
+              style={{ position: 'absolute', inset: 0 }}
+            >
+              {!thumbError && thumbImage && (
+                <img
+                  src={url.replace(/\.mp4$/, '.jpg')}
+                  alt="thumbnail"
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                />
+              )}
+            </div>
+            <div
+              style={{
+                position: 'absolute',
+                top: '50%',
+                left: '50%',
+                transform: 'translate(-50%, -50%)',
+                color: '#fff',
+                textAlign: 'center'
+              }}
+            >
+              <div style={{ marginBottom: 8 }}>Video: {fileName}</div>
+              <div style={{ marginBottom: 8 }}>Frames: {numFrames}</div>
+              <div style={{ marginBottom: 16 }}>FPS: {fps}</div>
+              <div
+                style={{
+                  width: 40,
+                  height: 40,
+                  border: '4px solid rgba(255,255,255,0.3)',
+                  borderTopColor: 'white',
+                  borderRadius: '50%',
+                  animation: 'spin 1s linear infinite',
+                  margin: '0 auto'
+                }}
+              />
+            </div>
+          </>
+        )}
+        {/* Video frame canvas */}
         <canvas
           ref={canvasRef}
-          style={{ width: '100%', height: '100%', display: 'block' }}
+          style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}
         />
       </div>
+      {/* URL input */}
       <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
         <input
-          style={{ flex: 1, padding: 8, borderRadius: 4, border: '1px solid #ccc' }}
+          type="text"
           value={url}
           onChange={e => setUrl(e.target.value)}
+          placeholder="Enter local video path"
+          style={{ flex: 1, padding: 8, borderRadius: 4, border: '1px solid #ccc' }}
         />
       </div>
     </div>
